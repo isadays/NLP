@@ -1,0 +1,149 @@
+# Import Libraries
+import pandas as pd
+import re
+from sklearn.utils.class_weight import compute_class_weight
+import numpy as np
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
+from transformers import BertTokenizer, TFBertModel
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.metrics import classification_report
+
+# Step 1: Load the Dataset
+df = pd.read_csv('customer_calls.csv')
+print("Original Label Distribution:")
+print(df['label'].value_counts())
+
+# Step 2: Clean the Transcriptions
+def clean_text(text):
+    text = str(text)
+    text = text.lower()
+    text = re.sub(r'http\S+', '', text)  # Remove URLs
+    text = re.sub(r'\S+@\S+', '', text)  # Remove emails
+    text = re.sub(r'[^a-zà-ÿ0-9\s.,!?]', '', text)  # Remove unwanted chars
+    text = re.sub(r'\s+', ' ', text).strip()  # Remove extra spaces
+    return text
+
+df['transcription'] = df['transcription'].apply(clean_text)
+print("\nSample Cleaned Transcriptions:")
+print(df['transcription'].head())
+
+# Step 3: Encode Labels and Calculate Class Weights
+label_mapping = {'solved': 0, 'unsolved': 1, 'no_answer': 2}
+df['label_encoded'] = df['label'].map(label_mapping)
+
+classes = np.unique(df['label_encoded'])
+class_weights = compute_class_weight(class_weight='balanced', classes=classes, y=df['label_encoded'])
+class_weights_dict = {i : class_weights[i] for i in range(len(class_weights))}
+print("\nComputed Class Weights:", class_weights_dict)
+
+# Step 4: Tokenization with BERTimbau
+tokenizer = BertTokenizer.from_pretrained("neuralmind/bert-base-portuguese-cased")
+
+def tokenize_function(texts, max_length=128):
+    return tokenizer(
+        texts,
+        padding='max_length',
+        truncation=True,
+        max_length=max_length,
+        return_tensors='tf'
+    )
+
+# Step 5: Split Data and Create TensorFlow Datasets
+train_texts, val_texts, train_labels, val_labels = train_test_split(
+    df['transcription'].tolist(),
+    df['label_encoded'].tolist(),
+    test_size=0.2,
+    random_state=42,
+    stratify=df['label_encoded']
+)
+
+train_encodings = tokenize_function(train_texts)
+val_encodings = tokenize_function(val_texts)
+
+train_dataset = tf.data.Dataset.from_tensor_slices((
+    {
+        'input_ids': train_encodings['input_ids'],
+        'attention_mask': train_encodings['attention_mask']
+    },
+    train_labels
+))
+
+val_dataset = tf.data.Dataset.from_tensor_slices((
+    {
+        'input_ids': val_encodings['input_ids'],
+        'attention_mask': val_encodings['attention_mask']
+    },
+    val_labels
+))
+
+batch_size = 16
+
+train_dataset = train_dataset.shuffle(buffer_size=len(train_texts)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+val_dataset = val_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+# Step 6: Build the BERT-Based Classification Model
+bert_model = TFBertModel.from_pretrained("neuralmind/bert-base-portuguese-cased")
+
+input_ids = tf.keras.Input(shape=(128,), dtype=tf.int32, name='input_ids')
+attention_mask = tf.keras.Input(shape=(128,), dtype=tf.int32, name='attention_mask')
+
+bert_outputs = bert_model(input_ids, attention_mask=attention_mask)
+pooled_output = bert_outputs.pooler_output
+
+dropout = tf.keras.layers.Dropout(0.3)(pooled_output)
+num_classes = 3  # 'solved', 'unsolved', 'no_answer'
+output = tf.keras.layers.Dense(num_classes, activation='softmax')(dropout)
+
+model = tf.keras.Model(inputs=[input_ids, attention_mask], outputs=output)
+print("\nModel Summary:")
+model.summary()
+
+# Step 7: Compile the Model
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=2e-5),
+    loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+    metrics=['accuracy']
+)
+
+# Step 8: Define Callbacks
+early_stopping = EarlyStopping(
+    monitor='val_loss',
+    patience=3,
+    restore_best_weights=True
+)
+
+checkpoint = ModelCheckpoint(
+    'best_model.h5',
+    monitor='val_loss',
+    save_best_only=True,
+    verbose=1
+)
+
+# Step 9: Train the Model
+history = model.fit(
+    train_dataset,
+    epochs=10,
+    validation_data=val_dataset,
+    callbacks=[early_stopping, checkpoint],
+    class_weight=class_weights_dict
+)
+
+# Step 10: Evaluate the Model
+# Load the best model
+model.load_weights('best_model.h5')
+
+val_predictions = model.predict(val_dataset)
+val_pred_labels = np.argmax(val_predictions, axis=1)
+
+val_true_labels = []
+for batch in val_dataset:
+    labels = batch[1].numpy()
+    val_true_labels.extend(labels)
+
+print("\nClassification Report:")
+print(classification_report(val_true_labels, val_pred_labels, target_names=label_mapping.keys()))
+
+# Step 11: Save the Final Model and Tokenizer
+model.save('bertimbau_text_classification_model')
+tokenizer.save_pretrained('bertimbau_text_classification_model')
