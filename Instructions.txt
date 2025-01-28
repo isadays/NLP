@@ -1,0 +1,61 @@
+Building and Testing the Modified Docker Image
+Ensure requirements.txt is Properly Configured:
+
+Create a requirements.txt in your project directory (~/bert_project) with necessary Python packages.
+
+Example requirements.txt:
+
+makefile
+Copiar
+transformers==4.28.0
+datasets==2.12.1
+tensorflow-addons==0.20.0
+numpy==1.23.5
+pandas==1.5.3
+Build the Docker Image:
+
+Navigate to your project directory and build the Docker image.
+
+bash
+Copiar
+cd ~/bert_project
+docker build -t bert-tf-gpu .
+Run the Docker Container:
+
+Test the Docker image to ensure TensorFlow can access the GPU.
+
+bash
+Copiar
+docker run --gpus all -it --rm bert-tf-gpu bash
+Verify TensorFlow GPU Access Inside the Container:
+
+Inside the container, run:
+
+bash
+Copiar
+python
+Then, in the Python interpreter:
+
+python
+Copiar
+import tensorflow as tf
+print("TensorFlow version:", tf.__version__)
+print("Num GPUs Available:", len(tf.config.list_physical_devices('GPU')))
+Expected Output:
+
+yaml
+Copiar
+TensorFlow version: 2.12.0
+Num GPUs Available: 1
+Exit Python:
+
+python
+Copiar
+exit()
+Run Your Training Script:
+
+Ensure your training script (train_bert.py) is present in /app and run:
+
+bash
+Copiar
+python train_bert.py
