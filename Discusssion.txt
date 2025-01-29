@@ -1,1 +1,2 @@
 https://stackoverflow.com/questions/77338229/tensorflow-2-14-0-with-cuda-not-registering-cuda
+https://github.com/tensorflow/tensorflow/issues/80538
