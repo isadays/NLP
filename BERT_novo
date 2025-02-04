@@ -1,353 +1,292 @@
-# bert_text_classification.py
-
-# ================================================
-# Imports
-# ================================================
-
-import pandas as pd
 import re
+import os
 import numpy as np
-from sklearn.utils.class_weight import compute_class_weight
+import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
-import tensorflow as tf
-from transformers import BertTokenizer, TFBertModel
-from tensorflow.keras.layers import Input, Dropout, Dense
-from tensorflow.keras.models import Model
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-import nlpaug.augmenter.word as naw
-import os
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertModel, AdamW, get_linear_schedule_with_warmup
 
 # ================================================
-# Step 1: Load the Dataset
+# Step 1: Data Loading and Cleaning
 # ================================================
 
-# Path to your CSV file
 DATA_PATH = 'customer_calls.csv'
-
-# Load the dataset
 df = pd.read_csv(DATA_PATH)
 
-# Display the original label distribution
+# Display original label distribution
 print("Original Label Distribution:")
 print(df['label'].value_counts())
-
-# ================================================
-# Step 2: Data Cleaning
-# ================================================
 
 def clean_text(text):
     """
     Clean the input text by:
     - Lowercasing
-    - Removing URLs
-    - Removing email addresses
+    - Removing URLs and email addresses
     - Removing unwanted characters (retain .,!?)
     - Removing extra spaces
     """
     text = str(text).lower()
     text = re.sub(r'http\S+', '', text)  # Remove URLs
-    text = re.sub(r'\S+@\S+', '', text)  # Remove email addresses
+    text = re.sub(r'\S+@\S+', '', text)   # Remove email addresses
     text = re.sub(r'[^a-zà-ÿ0-9\s.,!?]', '', text)  # Remove unwanted characters
     text = re.sub(r'\s+', ' ', text).strip()  # Remove extra spaces
     return text
 
-# Apply cleaning to transcriptions
+# Clean transcriptions
 df['transcription'] = df['transcription'].apply(clean_text)
-
-# Verify cleaning
 print("\nSample Cleaned Transcriptions:")
 print(df['transcription'].head())
 
 # ================================================
-# Step 3: Prepare Training Data
+# Step 2: Prepare Data for Binary Classification
 # ================================================
-
-# Filter out "no_answer" cases for training
-train_df = df[df['label'] != 'no_answer'].copy()
-
-# Define label mapping for binary classification
+# We will ignore "no_answer" cases in training and map labels:
 # 1: solved, 0: unsolved
+
+train_df = df[df['label'] != 'no_answer'].copy()
 label_mapping = {'solved': 1, 'unsolved': 0}
 train_df['label_binary'] = train_df['label'].map(label_mapping)
-
-# Display new label distribution
 print("\nBinary Label Distribution:")
 print(train_df['label_binary'].value_counts())
 
-# ================================================
-# Step 4: Handle Class Imbalance
-# ================================================
-
-# Extract labels
-labels = train_df['label_binary'].values
-
-# Compute class weights
-class_weights = compute_class_weight(class_weight='balanced',
-                                     classes=np.unique(labels),
-                                     y=labels)
-class_weights_dict = {i: class_weights[i] for i in range(len(class_weights))}
-print("\nComputed Class Weights:", class_weights_dict)
-
-# ================================================
-# Step 5: Data Augmentation
-# ================================================
-
-# Initialize synonym augmenter
-syn_aug = naw.SynonymAug(aug_p=0.3)  # 30% of words will be augmented
-
-# Extract 'unsolved' samples
+# (Optional) If you need to augment the data (e.g. for imbalanced classes), you could use nlpaug.
+# For example, augmenting the unsolved samples:
+import nlpaug.augmenter.word as naw
+syn_aug = naw.SynonymAug(aug_p=0.3)  # Augment 30% of the words
 unsolved_df = train_df[train_df['label_binary'] == 0]
-
-# Check if there are unsolved samples
 if not unsolved_df.empty:
-    # Apply augmentation
     augmented_texts = unsolved_df['transcription'].apply(lambda x: syn_aug.augment(x))
-    
-    # Create augmented DataFrame
     augmented_unsolved_df = pd.DataFrame({
         'transcription': augmented_texts,
         'label_binary': unsolved_df['label_binary']
     })
-    
-    # Append augmented data to training DataFrame
-    train_df_augmented = pd.concat([train_df, augmented_unsolved_df], ignore_index=True)
-    
-    # Verify new label distribution
+    train_df = pd.concat([train_df, augmented_unsolved_df], ignore_index=True)
     print("\nLabel Distribution after Augmentation:")
-    print(train_df_augmented['label_binary'].value_counts())
+    print(train_df['label_binary'].value_counts())
 else:
     print("\nNo 'unsolved' samples to augment.")
-    train_df_augmented = train_df.copy()
 
 # ================================================
-# Step 6: Tokenization with BERTimbau
+# Step 3: Tokenization using BERTimbau Tokenizer
 # ================================================
 
-# Load BERTimbau tokenizer
-tokenizer = BertTokenizer.from_pretrained("neuralmind/bert-base-portuguese-cased")
+MODEL_NAME = "neuralmind/bert-base-portuguese-cased"
+tokenizer = BertTokenizer.from_pretrained(MODEL_NAME)
 
-def tokenize_texts(texts, max_length=128):
-    """
-    Tokenize texts using BERT tokenizer
-    """
+# Set maximum sequence length to 200 tokens (words may be slightly different from tokens)
+MAX_LEN = 200
+
+def tokenize_texts(texts, max_length=MAX_LEN):
     return tokenizer(
         texts.tolist(),
         padding='max_length',
         truncation=True,
         max_length=max_length,
-        return_tensors='tf'
+        return_tensors='pt'
     )
 
-# Tokenize training and validation texts
-train_encodings = tokenize_texts(train_df_augmented['transcription'])
-val_encodings = tokenize_texts(train_df_augmented['transcription'], max_length=128)
-
-# ================================================
-# Step 7: Split Data into Training and Validation Sets
-# ================================================
-
-# Since the dataset is small, we can use stratified splitting
+# Split into training and validation sets (stratified)
 train_texts, val_texts, train_labels, val_labels = train_test_split(
-    train_df_augmented['transcription'].tolist(),
-    train_df_augmented['label_binary'].tolist(),
+    train_df['transcription'].tolist(),
+    train_df['label_binary'].tolist(),
     test_size=0.2,
     random_state=42,
-    stratify=train_df_augmented['label_binary']
+    stratify=train_df['label_binary']
 )
 
-# Re-tokenize based on split
-train_encodings = tokenize_texts(train_texts)
-val_encodings = tokenize_texts(val_texts)
+# Tokenize the splits
+train_encodings = tokenize_texts(pd.Series(train_texts))
+val_encodings = tokenize_texts(pd.Series(val_texts))
 
-# Create TensorFlow datasets
-train_dataset = tf.data.Dataset.from_tensor_slices((
-    {
-        'input_ids': train_encodings['input_ids'],
-        'attention_mask': train_encodings['attention_mask']
-    },
-    train_labels
-))
+# ================================================
+# Step 4: Create a Custom Dataset
+# ================================================
 
-val_dataset = tf.data.Dataset.from_tensor_slices((
-    {
-        'input_ids': val_encodings['input_ids'],
-        'attention_mask': val_encodings['attention_mask']
-    },
-    val_labels
-))
+class CallDataset(Dataset):
+    def __init__(self, encodings, labels=None):
+        self.encodings = encodings
+        self.labels = labels  # labels can be None for test data
 
-# Batch size
+    def __getitem__(self, idx):
+        item = {key: self.encodings[key][idx] for key in self.encodings}
+        if self.labels is not None:
+            item['labels'] = torch.tensor(self.labels[idx], dtype=torch.float)
+        return item
+
+    def __len__(self):
+        return len(self.encodings['input_ids'])
+
+train_dataset = CallDataset(train_encodings, train_labels)
+val_dataset = CallDataset(val_encodings, val_labels)
+
+# ================================================
+# Step 5: Define the Custom BERT Classifier Model
+# ================================================
+
+class BertClassifier(nn.Module):
+    def __init__(self, model_name, dropout_prob=0.3):
+        super(BertClassifier, self).__init__()
+        self.bert = BertModel.from_pretrained(model_name)
+        self.dropout = nn.Dropout(dropout_prob)
+        # Adding an extra tanh activation layer before final linear layer.
+        # Hidden size is taken from the BERT model config.
+        hidden_size = self.bert.config.hidden_size  
+        self.tanh = nn.Tanh()
+        self.classifier = nn.Linear(hidden_size, 1)  # Binary classification
+
+    def forward(self, input_ids, attention_mask):
+        # Get outputs from BERT. The pooled output is the [CLS] token representation.
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs.pooler_output  # shape: (batch_size, hidden_size)
+        x = self.dropout(pooled_output)
+        x = self.tanh(x)           # tanh activation layer
+        logits = self.classifier(x)
+        return logits
+
+# Instantiate the model
+model = BertClassifier(MODEL_NAME)
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+model.to(device)
+
+# ================================================
+# Step 6: Set Hyperparameters and Prepare Training
+# ================================================
+
+# Hyperparameters
+EPOCHS = 4
 BATCH_SIZE = 16
+LEARNING_RATE = 2e-5
 
-# Prepare datasets
-train_dataset = train_dataset.shuffle(buffer_size=len(train_texts)).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
-val_dataset = val_dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+# Create DataLoaders
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-# ================================================
-# Step 8: Build the BERT-Based Binary Classification Model
-# ================================================
+# Use AdamW optimizer
+optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
 
-# Load pre-trained BERTimbau model
-bert_model = TFBertModel.from_pretrained("neuralmind/bert-base-portuguese-cased")
+# Total training steps
+total_steps = len(train_loader) * EPOCHS
 
-# Define model inputs
-input_ids = Input(shape=(128,), dtype=tf.int32, name='input_ids')
-attention_mask = Input(shape=(128,), dtype=tf.int32, name='attention_mask')
+# Learning rate scheduler
+scheduler = get_linear_schedule_with_warmup(optimizer,
+                                            num_warmup_steps=int(0.1 * total_steps),
+                                            num_training_steps=total_steps)
 
-# Get BERT outputs
-bert_outputs = bert_model(input_ids, attention_mask=attention_mask)
-pooled_output = bert_outputs.pooler_output  # [CLS] token
-
-# Add dropout for regularization
-dropout = Dropout(0.3)(pooled_output)
-
-# Add output layer for binary classification
-output = Dense(1, activation='sigmoid')(dropout)
-
-# Create the model
-model = Model(inputs=[input_ids, attention_mask], outputs=output)
-
-# Display the model architecture
-print("\nModel Summary:")
-model.summary()
+# Loss function: since our model outputs raw logits and labels are float (0 or 1),
+# we use BCEWithLogitsLoss (which applies a sigmoid internally).
+criterion = nn.BCEWithLogitsLoss()
 
 # ================================================
-# Step 9: Compile the Model
+# Step 7: Training Loop
 # ================================================
 
-# Compile the model with Binary Crossentropy loss and Adam optimizer
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=2e-5),
-    loss=tf.keras.losses.BinaryCrossentropy(),
-    metrics=['accuracy']
-)
+def train_epoch(model, data_loader, optimizer, scheduler, criterion, device):
+    model.train()
+    total_loss = 0
+    for batch in data_loader:
+        optimizer.zero_grad()
+        # Move batch data to device
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device).unsqueeze(1)  # shape: (batch_size, 1)
+        
+        # Forward pass
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        loss = criterion(outputs, labels)
+        total_loss += loss.item()
+        
+        # Backward pass and optimization step
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+    avg_loss = total_loss / len(data_loader)
+    return avg_loss
+
+def eval_model(model, data_loader, criterion, device):
+    model.eval()
+    total_loss = 0
+    predictions = []
+    true_labels = []
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device).unsqueeze(1)
+            
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
+            
+            # Get predicted probabilities and then convert to binary predictions
+            preds = torch.sigmoid(outputs)
+            predictions.extend(preds.cpu().numpy())
+            true_labels.extend(labels.cpu().numpy())
+    avg_loss = total_loss / len(data_loader)
+    return avg_loss, predictions, true_labels
+
+print("\nStarting training...\n")
+for epoch in range(EPOCHS):
+    train_loss = train_epoch(model, train_loader, optimizer, scheduler, criterion, device)
+    val_loss, val_preds, val_true = eval_model(model, val_loader, criterion, device)
+    print(f"Epoch {epoch+1}/{EPOCHS}")
+    print(f"  Training Loss: {train_loss:.4f}")
+    print(f"  Validation Loss: {val_loss:.4f}")
 
 # ================================================
-# Step 10: Define Callbacks
+# Step 8: Evaluate the Model
 # ================================================
 
-# Early Stopping to prevent overfitting
-early_stopping = EarlyStopping(
-    monitor='val_loss',
-    patience=3,
-    restore_best_weights=True
-)
+# Convert probabilities to binary labels (threshold = 0.5)
+val_pred_labels = [1 if p >= 0.5 else 0 for batch in val_preds for p in batch.flatten()]
+val_true_labels = [int(t) for batch in val_true for t in batch.flatten()]
 
-# Model Checkpoint to save the best model
-checkpoint_filepath = 'best_model.h5'
-checkpoint = ModelCheckpoint(
-    filepath=checkpoint_filepath,
-    monitor='val_loss',
-    save_best_only=True,
-    verbose=1
-)
-
-# ================================================
-# Step 11: Train the Model
-# ================================================
-
-# Train the model
-history = model.fit(
-    train_dataset,
-    epochs=10,  # Adjust as needed
-    validation_data=val_dataset,
-    callbacks=[early_stopping, checkpoint],
-    class_weight=class_weights_dict
-)
-
-# ================================================
-# Step 12: Evaluate the Model
-# ================================================
-
-# Load the best model weights
-model.load_weights(checkpoint_filepath)
-
-# Make predictions on validation set
-val_predictions = model.predict(val_dataset)
-val_pred_labels = (val_predictions.flatten() >= 0.5).astype(int)
-
-# Extract true labels
-val_true_labels = []
-for batch in val_dataset:
-    labels = batch[1].numpy()
-    val_true_labels.extend(labels)
-
-# Generate classification report
-print("\nClassification Report:")
+print("\nClassification Report on Validation Set:")
 print(classification_report(val_true_labels, val_pred_labels, target_names=['unsolved', 'solved']))
 
 # ================================================
-# Step 13: Apply the Model to "No Answer" Cases
+# Step 9: Apply the Model to "No Answer" Cases
 # ================================================
 
-# Filter "no_answer" cases
+# Filter "no_answer" cases and clean text
 no_answer_df = df[df['label'] == 'no_answer'].copy()
-
-# Ensure transcriptions are cleaned
 no_answer_df['transcription'] = no_answer_df['transcription'].apply(clean_text)
 
-# Tokenize the "no answer" transcriptions
-no_answer_encodings = tokenize_texts(no_answer_df['transcription'])
+# Tokenize these texts
+no_answer_encodings = tokenize_texts(pd.Series(no_answer_df['transcription']))
+# Create dataset and loader
+no_answer_dataset = CallDataset(no_answer_encodings)
+no_answer_loader = DataLoader(no_answer_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-# Create TensorFlow dataset for prediction
-no_answer_dataset = tf.data.Dataset.from_tensor_slices((
-    {
-        'input_ids': no_answer_encodings['input_ids'],
-        'attention_mask': no_answer_encodings['attention_mask']
-    }
-)).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+model.eval()
+predictions = []
+with torch.no_grad():
+    for batch in no_answer_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        probs = torch.sigmoid(outputs)
+        predictions.extend(probs.cpu().numpy())
+no_answer_pred_labels = [1 if p >= 0.5 else 0 for batch in predictions for p in batch.flatten()]
 
-# Make predictions on "no answer" dataset
-no_answer_predictions = model.predict(no_answer_dataset)
-no_answer_pred_labels = (no_answer_predictions.flatten() >= 0.5).astype(int)
-
-# Add predictions to the "no answer" DataFrame
-no_answer_df['predicted_label'] = no_answer_pred_labels
-
-# Map numerical labels back to string labels
+# Map numerical predictions back to string labels
 reverse_label_mapping = {0: 'unsolved', 1: 'solved'}
+no_answer_df['predicted_label'] = no_answer_pred_labels
 no_answer_df['predicted_label_str'] = no_answer_df['predicted_label'].map(reverse_label_mapping)
 
-# Display the predictions
 print("\nPredictions on 'No Answer' Cases:")
 print(no_answer_df[['transcription', 'predicted_label_str']].head())
 
 # ================================================
-# Step 14: Save the Model and Tokenizer
+# Step 10: Save the Model and Tokenizer
 # ================================================
-
-# Directory to save the model and tokenizer
 MODEL_DIR = 'bertimbau_binary_classification_model'
-
-# Create the directory if it doesn't exist
 if not os.path.exists(MODEL_DIR):
     os.makedirs(MODEL_DIR)
 
-# Save the trained model
-model.save(MODEL_DIR)
-
-# Save the tokenizer
+# Save model state_dict and tokenizer
+torch.save(model.state_dict(), os.path.join(MODEL_DIR, 'pytorch_model.bin'))
 tokenizer.save_pretrained(MODEL_DIR)
-
 print(f"\nModel and tokenizer saved to '{MODEL_DIR}' directory.")
-
-# ================================================
-# Step 15: Load the Model and Tokenizer (Optional)
-# ================================================
-
-# To load the model and tokenizer later, use the following code:
-
-# from transformers import BertTokenizer
-# import tensorflow as tf
-# from tensorflow.keras.models import load_model
-
-# # Load the tokenizer
-# tokenizer_loaded = BertTokenizer.from_pretrained(MODEL_DIR)
-
-# # Load the model (ensure to specify custom_objects for BERT layers)
-# model_loaded = load_model(MODEL_DIR, custom_objects={'TFBertModel': TFBertModel})
-
-# ================================================
-# End of Script
-# ================================================
