@@ -290,3 +290,47 @@ if not os.path.exists(MODEL_DIR):
 torch.save(model.state_dict(), os.path.join(MODEL_DIR, 'pytorch_model.bin'))
 tokenizer.save_pretrained(MODEL_DIR)
 print(f"\nModel and tokenizer saved to '{MODEL_DIR}' directory.")
+
+# ================================================
+# Step: Inference on "No Answer" Cases (Both Probabilities and Predicted Labels)
+# ================================================
+
+# Filter "no_answer" cases and clean text
+no_answer_df = df[df['label'] == 'no_answer'].copy()
+no_answer_df['transcription'] = no_answer_df['transcription'].apply(clean_text)
+
+# Tokenize these texts
+no_answer_encodings = tokenize_texts(pd.Series(no_answer_df['transcription']))
+# Create dataset and loader for inference
+no_answer_dataset = CallDataset(no_answer_encodings)
+no_answer_loader = DataLoader(no_answer_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+model.eval()
+
+all_probabilities = []  # To store probability values
+all_pred_labels = []    # To store binary predictions
+
+with torch.no_grad():
+    for batch in no_answer_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        # Apply sigmoid to obtain probabilities
+        probs = torch.sigmoid(outputs)
+        # Convert probabilities to CPU numpy arrays
+        probs = probs.cpu().numpy().flatten()
+        all_probabilities.extend(probs.tolist())
+        # Determine predicted label (threshold = 0.5)
+        preds = (probs >= 0.5).astype(int)
+        all_pred_labels.extend(preds.tolist())
+
+# Add probabilities and predictions to the dataframe
+no_answer_df['predicted_probability'] = all_probabilities
+no_answer_df['predicted_label'] = all_pred_labels
+
+# Map numerical predictions back to string labels (if desired)
+reverse_label_mapping = {0: 'unsolved', 1: 'solved'}
+no_answer_df['predicted_label_str'] = no_answer_df['predicted_label'].map(reverse_label_mapping)
+
+print("\nPredictions on 'No Answer' Cases (with Probabilities):")
+print(no_answer_df[['transcription', 'predicted_probability', 'predicted_label_str']].head())
